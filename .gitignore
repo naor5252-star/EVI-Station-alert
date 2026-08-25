@@ -1,0 +1,8 @@
+node_modules/
+.dev.vars
+.wrangler/
+.DS_Store
+.env
+.env.*
+!config.example.js
+*.log
