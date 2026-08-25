@@ -1,30 +1,17 @@
 const SONOL_BASE = "https://account.sonolevi.co.il";
 const MAP_PAGE = `${SONOL_BASE}/findCharger`;
 
-const HADERA_BOUNDS = {
-  northEastLat: 32.50,
-  northEastLng: 35.01,
-  southWestLat: 32.37,
-  southWestLng: 34.84,
-};
-
-const MATCH_TOKENS = [
-  ["גמלא 3", 30],
-  ["gamla 3", 30],
-  ["סנטר פארק", 20],
-  ["center park", 20],
-  ["גמלא", 10],
-  ["gamla", 10],
-  ["חדרה", 6],
-  ["hadera", 6],
-];
+// Known SONOL EVI stations at Center Park / Gamla 3, Hadera.
+// Optional override in Cloudflare:
+// GAMLA_STATION_IDS=2733,2790
+const DEFAULT_STATION_IDS = ["2733", "2790"];
 
 const EMPTY_STATE = {
   enabled: false,
   lastCheck: null,
   lastError: null,
   availableCount: 0,
-  station: null,
+  stations: [],
   sockets: [],
   availableSocketKeys: [],
 };
@@ -39,6 +26,7 @@ export default {
           ok: true,
           service: "EVI Station Alert",
           monitorInterval: "5 minutes",
+          stationIds: getStationIds(env),
         });
       }
 
@@ -55,13 +43,18 @@ export default {
         }
 
         const state = await loadState(env);
+        const wasEnabled = state.enabled;
         state.enabled = body.enabled;
         state.lastError = null;
+
+        if (body.enabled && !wasEnabled) {
+          state.availableSocketKeys = [];
+        }
+
         await saveState(env, state);
 
         if (body.enabled) {
-          const updated = await checkAndStore(env, { notify: true });
-          return responseJSON(updated);
+          return responseJSON(await checkAndStore(env, { notify: true }));
         }
 
         return responseJSON(await loadState(env));
@@ -73,7 +66,10 @@ export default {
 
       return responseJSON({ error: "Not found" }, 404);
     } catch (error) {
-      return responseJSON({ error: String(error?.message || error) }, error?.status || 500);
+      return responseJSON(
+        { error: String(error?.message || error) },
+        error?.status || 500,
+      );
     }
   },
 
@@ -93,9 +89,23 @@ export default {
   },
 };
 
+function getStationIds(env) {
+  if (env.GAMLA_STATION_IDS) {
+    const ids = String(env.GAMLA_STATION_IDS)
+      .split(",")
+      .map((id) => id.trim())
+      .filter(Boolean);
+
+    if (ids.length) return [...new Set(ids)];
+  }
+
+  return DEFAULT_STATION_IDS;
+}
+
 function requireAuth(request, env) {
   const token = env.CONTROL_TOKEN || "";
   const actual = request.headers.get("Authorization") || "";
+
   if (!token || actual !== `Bearer ${token}`) {
     const error = new Error("Unauthorized");
     error.status = 401;
@@ -121,18 +131,20 @@ async function checkAndStore(env, { notify }) {
     lastCheck: new Date().toISOString(),
     lastError: null,
     availableCount: live.availableCount,
-    station: live.station,
+    stations: live.stations,
     sockets: live.sockets,
     availableSocketKeys: live.availableSocketKeys,
   };
 
   const previousSet = new Set(previous.availableSocketKeys || []);
-  const newlyAvailable = live.availableSocketKeys.filter((key) => !previousSet.has(key));
+  const newlyAvailableKeys = live.availableSocketKeys.filter(
+    (key) => !previousSet.has(key),
+  );
 
   await saveState(env, next);
 
-  if (notify && next.enabled && live.availableCount > 0 && newlyAvailable.length > 0) {
-    await sendNotification(env, live);
+  if (notify && next.enabled && newlyAvailableKeys.length > 0) {
+    await sendNotification(env, live, newlyAvailableKeys);
   }
 
   return next;
@@ -140,75 +152,61 @@ async function checkAndStore(env, { notify }) {
 
 async function fetchGamlaStatus(env) {
   const session = await openPublicSession();
+  const stationIds = getStationIds(env);
 
-  // After the first successful live run, set GAMLA_STATION_ID as a Worker secret/variable
-  // to skip discovery and make each 5-minute check a single station-details request.
-  if (env.GAMLA_STATION_ID) {
-    return fetchStationById(session, String(env.GAMLA_STATION_ID));
+  const stations = [];
+  const sockets = [];
+
+  for (const stationId of stationIds) {
+    const result = await fetchStationById(session, stationId);
+    stations.push(result.station);
+    sockets.push(...result.sockets);
   }
 
-  const boundsResponse = await sonolAPI(
-    session,
-    "POST",
-    "/stationFacade/findStationsInBounds",
-    {
-      filterByIsManaged: true,
-      filterByBounds: HADERA_BOUNDS,
-    },
-    true,
-  );
+  const availableSocketKeys = sockets
+    .filter((socket) => socket.available)
+    .map((socket) => `${socket.stationId}:${socket.id}`);
 
-  const stations = Array.isArray(boundsResponse?.data) ? boundsResponse.data : [];
-  if (!stations.length) {
-    throw new Error("SONOL returned no stations in the Hadera search area");
-  }
-
-  const ranked = stations
-    .map((station) => ({ station, score: matchScore(station) }))
-    .sort((a, b) => b.score - a.score);
-
-  const best = ranked[0];
-  if (!best || best.score < 10) {
-    const candidates = ranked.slice(0, 8).map(({ station, score }) => ({
-      score,
-      id: station?.id ?? station?.stationId,
-      text: searchableText(station).slice(0, 220),
-    }));
-    throw new Error(`Could not confidently identify Gamla 3. Candidates: ${JSON.stringify(candidates)}`);
-  }
-
-  const stationId = best.station?.id ?? best.station?.stationId;
-  if (stationId == null) throw new Error("Matched station has no station ID");
-
-  return fetchStationById(session, String(stationId), best.score);
+  return {
+    stations,
+    sockets,
+    availableCount: sockets.filter((socket) => socket.available).length,
+    availableSocketKeys,
+  };
 }
 
-async function fetchStationById(session, stationId, discoveryScore = 100) {
+async function fetchStationById(session, stationId) {
   const result = await sonolAPI(
     session,
     "GET",
     "/stationFacade/findStationById",
     { stationId },
-    false,
   );
 
-  const station = result?.data;
-  if (!station || typeof station !== "object") {
-    throw new Error("findStationById returned no station data");
+  const rawStation = result?.data;
+  if (!rawStation || typeof rawStation !== "object") {
+    throw new Error(`findStationById returned no data for station ${stationId}`);
   }
 
-  if (discoveryScore < 100 && Math.max(discoveryScore, matchScore(station)) < 10) {
-    throw new Error("Station details did not validate the Gamla 3 match");
-  }
+  const station = {
+    id: String(stationId),
+    name: stationLabel(rawStation),
+    address: stationAddress(rawStation),
+    availableCount: 0,
+    socketCount: 0,
+  };
 
-  const rawSockets = Array.isArray(station.stationSockets)
-    ? station.stationSockets
-    : (Array.isArray(station.sockets) ? station.sockets : []);
+  const rawSockets = Array.isArray(rawStation.stationSockets)
+    ? rawStation.stationSockets
+    : (Array.isArray(rawStation.sockets) ? rawStation.sockets : []);
 
   const sockets = rawSockets.map((socket, index) => {
     const status = effectiveStatus(socket);
+
     return {
       id: String(socket?.id ?? socket?.stationSocketId ?? index + 1),
+      stationId: String(stationId),
+      stationName: station.name,
       name: String(
         socket?.socketCaption ??
         socket?.caption ??
@@ -226,20 +224,10 @@ async function fetchStationById(session, stationId, discoveryScore = 100) {
     };
   });
 
-  const availableSocketKeys = sockets
-    .filter((socket) => socket.available)
-    .map((socket) => `${stationId}:${socket.id}`);
+  station.socketCount = sockets.length;
+  station.availableCount = sockets.filter((socket) => socket.available).length;
 
-  return {
-    station: {
-      id: String(stationId),
-      name: stationLabel(station),
-      address: stationAddress(station),
-    },
-    sockets,
-    availableCount: sockets.filter((socket) => socket.available).length,
-    availableSocketKeys,
-  };
+  return { station, sockets };
 }
 
 async function openPublicSession() {
@@ -252,13 +240,28 @@ async function openPublicSession() {
     redirect: "follow",
   });
 
-  if (!response.ok) throw new Error(`findCharger HTTP ${response.status}`);
+  if (!response.ok) {
+    throw new Error(`findCharger HTTP ${response.status}`);
+  }
 
   const page = await response.text();
-  const csrf = firstMatch(page, /<meta\s+name=["']_csrf["']\s+content=["']([^"']+)["']/i)
-    || firstMatch(page, /name=["']_csrf["'][^>]*content=["']([^"']+)["']/i);
-  const csrfHeader = firstMatch(page, /<meta\s+name=["']_csrf_header["']\s+content=["']([^"']+)["']/i)
-    || "X-CSRF-TOKEN";
+
+  const csrf =
+    firstMatch(
+      page,
+      /<meta\s+name=["']_csrf["']\s+content=["']([^"']+)["']/i,
+    ) ||
+    firstMatch(
+      page,
+      /name=["']_csrf["'][^>]*content=["']([^"']+)["']/i,
+    );
+
+  const csrfHeader =
+    firstMatch(
+      page,
+      /<meta\s+name=["']_csrf_header["']\s+content=["']([^"']+)["']/i,
+    ) || "X-CSRF-TOKEN";
+
   const setCookie = response.headers.get("set-cookie") || "";
   const sessionCookie = firstMatch(setCookie, /(JSESSIONID=[^;]+)/i);
 
@@ -268,8 +271,9 @@ async function openPublicSession() {
   return { csrf, csrfHeader, cookie: sessionCookie };
 }
 
-async function sonolAPI(session, method, path, data, jsonMode) {
+async function sonolAPI(session, method, path, data) {
   let url = `${SONOL_BASE}${path}`;
+
   const headers = {
     "Accept": "application/json, text/javascript, */*; q=0.01",
     "X-JSON-TYPES": "None",
@@ -282,42 +286,43 @@ async function sonolAPI(session, method, path, data, jsonMode) {
     [session.csrfHeader]: session.csrf,
   };
 
-  let body;
-  if (method === "GET") {
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(data || {})) {
-      if (value !== undefined && value !== null) params.set(key, String(value));
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(data || {})) {
+    if (value !== undefined && value !== null) {
+      params.set(key, String(value));
     }
-    const query = params.toString();
-    if (query) url += `?${query}`;
-  } else if (jsonMode) {
-    headers["Content-Type"] = "application/json";
-    body = JSON.stringify(data || {});
-  } else {
-    headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8";
-    const params = new URLSearchParams();
-    for (const [key, value] of Object.entries(data || {})) {
-      if (value !== undefined && value !== null) params.set(key, String(value));
-    }
-    body = params.toString();
   }
 
-  const response = await fetch(url, { method, headers, body, redirect: "follow" });
+  const query = params.toString();
+  if (query) url += `?${query}`;
+
+  const response = await fetch(url, {
+    method,
+    headers,
+    redirect: "follow",
+  });
+
   const text = await response.text();
 
   if (!response.ok) {
-    throw new Error(`${path} HTTP ${response.status}: ${text.slice(0, 300)}`);
+    throw new Error(
+      `${path} HTTP ${response.status}: ${text.slice(0, 300)}`,
+    );
   }
 
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch {
-    throw new Error(`${path} did not return JSON: ${text.slice(0, 300)}`);
+    throw new Error(
+      `${path} did not return JSON: ${text.slice(0, 300)}`,
+    );
   }
 
   if (parsed?.success === false) {
-    throw new Error(`${path} returned success=false: ${JSON.stringify(parsed).slice(0, 500)}`);
+    throw new Error(
+      `${path} returned success=false: ${JSON.stringify(parsed).slice(0, 500)}`,
+    );
   }
 
   return parsed;
@@ -327,7 +332,13 @@ function effectiveStatus(socket) {
   if (socket?.blocked === true) return "UNAVAILABLE";
   if (socket?.inMaintenance === true) return "IN_MAINTENANCE";
   if (socket?.reserved === true) return "RESERVED";
-  return String(socket?.socketStatusId ?? socket?.socketStatus ?? socket?.status ?? "UNKNOWN").toUpperCase();
+
+  return String(
+    socket?.socketStatusId ??
+    socket?.socketStatus ??
+    socket?.status ??
+    "UNKNOWN"
+  ).toUpperCase();
 }
 
 function stationLabel(station) {
@@ -347,22 +358,72 @@ function stationAddress(station) {
     station?.stationAddressStreet,
     station?.stationAddressHouseNumber,
     station?.stationAddressCity,
-  ].filter((value) => value != null && String(value).trim() !== "").join(" ");
+  ]
+    .filter(
+      (value) => value != null && String(value).trim() !== "",
+    )
+    .join(" ");
 }
 
-function searchableText(value) {
-  const parts = [];
-  walk(value, parts);
-  return parts.join(" | ").toLowerCase();
+async function sendNotification(env, live, newlyAvailableKeys) {
+  if (!env.NTFY_TOPIC) return;
+
+  const newlyAvailableSet = new Set(newlyAvailableKeys);
+  const newlyAvailable = live.sockets.filter((socket) =>
+    newlyAvailableSet.has(`${socket.stationId}:${socket.id}`)
+  );
+
+  const connectorText = newlyAvailable
+    .map(
+      (socket) =>
+        `תחנה ${socket.stationId} — ${socket.name}`,
+    )
+    .join(" | ");
+
+  const message =
+    newlyAvailable.length === 1
+      ? `${connectorText} פנוי עכשיו`
+      : `${newlyAvailable.length} מחברים התפנו: ${connectorText}`;
+
+  const response = await fetch("https://ntfy.sh", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      topic: env.NTFY_TOPIC,
+      title: "⚡ עמדה פנויה בגמלא 3",
+      message,
+      priority: 4,
+      tags: ["zap", "electric_plug"],
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error(
+      `Notification service HTTP ${response.status}`,
+    );
+  }
 }
 
-function walk(value, parts) {
-  if (value == null) return;
-  if (Array.isArray(value)) {
-    for (const item of value) walk(item, parts);
-  } else if (typeof value === "object") {
-    for (const item of Object.values(value)) walk(item, parts);
-  } else if (["string", "number", "boolean"].includes(typeof value)) {
+function firstMatch(text, regex) {
+  const match = text.match(regex);
+  return match ? match[1] : null;
+}
+
+function responseJSON(body, status = 200) {
+  return new Response(
+    JSON.stringify(body, null, 2),
+    {
+      status,
+      headers: {
+        "Content-Type": "application/json; charset=utf-8",
+        "Cache-Control": "no-store",
+      },
+    },
+  );
+}
+) {
     parts.push(String(value));
   }
 }
