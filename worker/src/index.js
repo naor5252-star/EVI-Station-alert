@@ -14,6 +14,7 @@ const EMPTY_STATE = {
   stations: [],
   sockets: [],
   availableSocketKeys: [],
+  baselineHasAvailable: null,
 };
 
 export default {
@@ -25,7 +26,7 @@ export default {
         return responseJSON({
           ok: true,
           service: "EVI Station Alert",
-          monitorInterval: "5 minutes",
+          monitorInterval: "30 seconds",
           stationIds: getStationIds(env),
         });
       }
@@ -43,25 +44,46 @@ export default {
         }
 
         const state = await loadState(env);
-        const wasEnabled = state.enabled;
-        state.enabled = body.enabled;
-        state.lastError = null;
 
-        if (body.enabled && !wasEnabled) {
-          state.availableSocketKeys = [];
+        if (!body.enabled) {
+          state.enabled = false;
+          state.lastError = null;
+          await saveState(env, state);
+          return responseJSON(state);
         }
 
+        // Already ON: don't send another startup status message.
+        if (state.enabled) {
+          return responseJSON(state);
+        }
+
+        state.enabled = true;
+        state.lastError = null;
         await saveState(env, state);
 
-        if (body.enabled) {
-          return responseJSON(await checkAndStore(env, { notify: true }));
+        // Immediate sample. This becomes the aggregate availability baseline.
+        const current = await checkAndStore(env, {
+          notifyChanges: false,
+          preserveBaseline: false,
+        });
+
+        // Always send current status when monitoring is turned ON.
+        try {
+          await sendCurrentAvailabilityNotification(env, current, true);
+        } catch (error) {
+          current.lastError =
+            `Notification failed: ${String(error?.message || error)}`;
+          await saveState(env, current);
         }
 
-        return responseJSON(await loadState(env));
+        return responseJSON(current);
       }
 
       if (url.pathname === "/refresh" && request.method === "POST") {
-        return responseJSON(await checkAndStore(env, { notify: false }));
+        return responseJSON(await checkAndStore(env, {
+          notifyChanges: false,
+          preserveBaseline: true,
+        }));
       }
 
       if (url.pathname === "/test-notification" && request.method === "POST") {
@@ -81,21 +103,29 @@ export default {
     }
   },
 
-  async scheduled(_controller, env, ctx) {
-    ctx.waitUntil((async () => {
-      const state = await loadState(env);
-      if (!state.enabled) return;
-
-      try {
-        await checkAndStore(env, { notify: true });
-      } catch (error) {
-        state.lastCheck = new Date().toISOString();
-        state.lastError = String(error?.message || error);
-        await saveState(env, state);
-      }
-    })());
+  async scheduled(_controller, env, _ctx) {
+    await runScheduledCheck(env);
+    await scheduler.wait(30_000);
+    await runScheduledCheck(env);
   },
 };
+
+async function runScheduledCheck(env) {
+  const state = await loadState(env);
+  if (!state.enabled) return;
+
+  try {
+    await checkAndStore(env, {
+      notifyChanges: true,
+      preserveBaseline: false,
+    });
+  } catch (error) {
+    const latest = await loadState(env);
+    latest.lastCheck = new Date().toISOString();
+    latest.lastError = String(error?.message || error);
+    await saveState(env, latest);
+  }
+}
 
 function getStationIds(env) {
   if (env.GAMLA_STATION_IDS) {
@@ -130,9 +160,19 @@ async function saveState(env, state) {
   await env.STATE.put("monitor", JSON.stringify(state));
 }
 
-async function checkAndStore(env, { notify }) {
+async function checkAndStore(
+  env,
+  { notifyChanges, preserveBaseline = false },
+) {
   const previous = await loadState(env);
   const live = await fetchGamlaStatus(env);
+
+  const currentHasAvailable = live.availableCount > 0;
+
+  const previousHasAvailable =
+    typeof previous.baselineHasAvailable === "boolean"
+      ? previous.baselineHasAvailable
+      : ((previous.availableCount || 0) > 0);
 
   const next = {
     ...previous,
@@ -142,28 +182,22 @@ async function checkAndStore(env, { notify }) {
     stations: live.stations,
     sockets: live.sockets,
     availableSocketKeys: live.availableSocketKeys,
+    baselineHasAvailable: preserveBaseline
+      ? previousHasAvailable
+      : currentHasAvailable,
   };
 
-  const previousSet = new Set(previous.availableSocketKeys || []);
-  const newlyAvailableKeys = live.availableSocketKeys.filter(
-    (key) => !previousSet.has(key),
-  );
+  const availabilityFlipped =
+    previousHasAvailable !== currentHasAvailable;
 
-  // Manual refresh updates the display but must not consume an alert.
-  if (!notify && next.enabled) {
-    next.availableSocketKeys = previous.availableSocketKeys || [];
-  }
-
-  if (notify && next.enabled && newlyAvailableKeys.length > 0) {
+  if (notifyChanges && previous.enabled && availabilityFlipped) {
     try {
-      await sendNotification(env, live, newlyAvailableKeys);
+      await sendCurrentAvailabilityNotification(env, next, false);
     } catch (error) {
-      // Keep the old baseline so the next scheduled run retries the alert.
+      // Keep old baseline so the next 30-second sample retries the alert.
       next.lastError =
         `Notification failed: ${String(error?.message || error)}`;
-      next.availableSocketKeys =
-        previous.availableSocketKeys || [];
-
+      next.baselineHasAvailable = previousHasAvailable;
       await saveState(env, next);
       return next;
     }
@@ -388,23 +422,47 @@ function stationAddress(station) {
     .join(" ");
 }
 
-async function sendNotification(env, live, newlyAvailableKeys) {
-  const newlyAvailableSet = new Set(newlyAvailableKeys);
-
-  const newlyAvailable = live.sockets.filter((socket) =>
-    newlyAvailableSet.has(`${socket.stationId}:${socket.id}`)
+async function sendCurrentAvailabilityNotification(
+  env,
+  state,
+  monitoringStarted,
+) {
+  const available = (state.sockets || []).filter(
+    (socket) => socket.available
   );
 
-  const connectorText = newlyAvailable
-    .map((socket) =>
-      `תחנה ${socket.stationId} — ${socket.name}`
-    )
-    .join("\n");
+  let message;
 
-  const message =
-    newlyAvailable.length === 1
-      ? `⚡ עמדה פנויה בגמלא 3\n${connectorText} פנוי עכשיו`
-      : `⚡ ${newlyAvailable.length} מחברים התפנו בגמלא 3\n${connectorText}`;
+  if (available.length > 0) {
+    const lines = available.map(
+      (socket) =>
+        `🟢 תחנה ${socket.stationId} — ${socket.name}: פנוי`
+    );
+
+    message = [
+      monitoringStarted
+        ? "✅ המעקב הופעל"
+        : "🟢 יש עמדה פנויה בגמלא 3",
+      monitoringStarted
+        ? "🟢 יש עמדה פנויה בגמלא 3"
+        : null,
+      ...lines,
+      `סה״כ פנויים: ${available.length}`,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  } else {
+    message = [
+      monitoringStarted
+        ? "✅ המעקב הופעל"
+        : "🔴 אין עמדות פנויות בגמלא 3",
+      monitoringStarted
+        ? "🔴 אין עמדות פנויות בגמלא 3"
+        : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
 
   await sendTelegramText(env, message);
 }

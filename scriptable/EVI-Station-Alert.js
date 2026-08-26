@@ -171,7 +171,7 @@ async function buildWidget() {
     );
 
     error.font = Font.systemFont(10);
-    error.textColor = Color.secondaryLabel();
+    error.textColor = Color.gray();
     error.lineLimit = 4;
   } else {
     const summary = widget.addStack();
@@ -187,13 +187,13 @@ async function buildWidget() {
 
     const label = summary.addText("פנויים");
     label.font = Font.systemFont(13);
-    label.textColor = Color.secondaryLabel();
+    label.textColor = Color.gray();
 
     summary.addSpacer();
 
     const refresh = summary.addText("↻ רענן");
     refresh.font = Font.systemFont(12);
-    refresh.textColor = Color.link();
+    refresh.textColor = Color.blue();
     refresh.url = actionURL("refresh");
 
     widget.addSpacer(5);
@@ -205,7 +205,7 @@ async function buildWidget() {
         "לא התקבלו מחברים מהתחנות",
       );
       noSockets.font = Font.systemFont(11);
-      noSockets.textColor = Color.secondaryLabel();
+      noSockets.textColor = Color.gray();
     }
 
     for (const socket of rows) {
@@ -238,7 +238,7 @@ async function buildWidget() {
         statusHebrew(socket.status),
       );
       state.font = Font.systemFont(10);
-      state.textColor = Color.secondaryLabel();
+      state.textColor = Color.gray();
 
       widget.addSpacer(2);
     }
@@ -251,12 +251,12 @@ async function buildWidget() {
 
   const monitorText = footer.addText(
     status.enabled
-      ? "2733 + 2790 • כל 5 דקות"
+      ? "2733 + 2790 • בדיקה כל 30 שנ׳"
       : "המעקב כבוי",
   );
 
   monitorText.font = Font.systemFont(8);
-  monitorText.textColor = Color.secondaryLabel();
+  monitorText.textColor = Color.gray();
 
   footer.addSpacer();
 
@@ -265,7 +265,7 @@ async function buildWidget() {
   );
 
   last.font = Font.systemFont(8);
-  last.textColor = Color.secondaryLabel();
+  last.textColor = Color.gray();
 
   widget.refreshAfterDate = new Date(
     Date.now() +
