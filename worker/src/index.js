@@ -64,6 +64,14 @@ export default {
         return responseJSON(await checkAndStore(env, { notify: false }));
       }
 
+      if (url.pathname === "/test-notification" && request.method === "POST") {
+        await sendTelegramText(
+          env,
+          "⚡ בדיקת EVI Station Alert\nה-Worker מחובר ל-Telegram בהצלחה.",
+        );
+        return responseJSON({ ok: true, notification: "sent" });
+      }
+
       return responseJSON({ error: "Not found" }, 404);
     } catch (error) {
       return responseJSON(
@@ -141,12 +149,27 @@ async function checkAndStore(env, { notify }) {
     (key) => !previousSet.has(key),
   );
 
-  await saveState(env, next);
-
-  if (notify && next.enabled && newlyAvailableKeys.length > 0) {
-    await sendNotification(env, live, newlyAvailableKeys);
+  // Manual refresh updates the display but must not consume an alert.
+  if (!notify && next.enabled) {
+    next.availableSocketKeys = previous.availableSocketKeys || [];
   }
 
+  if (notify && next.enabled && newlyAvailableKeys.length > 0) {
+    try {
+      await sendNotification(env, live, newlyAvailableKeys);
+    } catch (error) {
+      // Keep the old baseline so the next scheduled run retries the alert.
+      next.lastError =
+        `Notification failed: ${String(error?.message || error)}`;
+      next.availableSocketKeys =
+        previous.availableSocketKeys || [];
+
+      await saveState(env, next);
+      return next;
+    }
+  }
+
+  await saveState(env, next);
   return next;
 }
 
@@ -366,45 +389,58 @@ function stationAddress(station) {
 }
 
 async function sendNotification(env, live, newlyAvailableKeys) {
-  if (!env.NTFY_TOPIC) return;
-
   const newlyAvailableSet = new Set(newlyAvailableKeys);
+
   const newlyAvailable = live.sockets.filter((socket) =>
     newlyAvailableSet.has(`${socket.stationId}:${socket.id}`)
   );
 
   const connectorText = newlyAvailable
-    .map(
-      (socket) =>
-        `תחנה ${socket.stationId} — ${socket.name}`,
+    .map((socket) =>
+      `תחנה ${socket.stationId} — ${socket.name}`
     )
-    .join(" | ");
+    .join("\n");
 
   const message =
     newlyAvailable.length === 1
-      ? `${connectorText} פנוי עכשיו`
-      : `${newlyAvailable.length} מחברים התפנו: ${connectorText}`;
+      ? `⚡ עמדה פנויה בגמלא 3\n${connectorText} פנוי עכשיו`
+      : `⚡ ${newlyAvailable.length} מחברים התפנו בגמלא 3\n${connectorText}`;
 
-  const response = await fetch("https://ntfy.sh", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
+  await sendTelegramText(env, message);
+}
+
+async function sendTelegramText(env, text) {
+  const token = env.TELEGRAM_BOT_TOKEN;
+  const chatId = env.TELEGRAM_CHAT_ID;
+
+  if (!token || !chatId) {
+    throw new Error("Telegram secrets are not configured");
+  }
+
+  const response = await fetch(
+    `https://api.telegram.org/bot${token}/sendMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        disable_web_page_preview: true,
+      }),
     },
-    body: JSON.stringify({
-      topic: env.NTFY_TOPIC,
-      title: "⚡ עמדה פנויה בגמלא 3",
-      message,
-      priority: 4,
-      tags: ["zap", "electric_plug"],
-    }),
-  });
+  );
+
+  const body = await response.text();
 
   if (!response.ok) {
     throw new Error(
-      `Notification service HTTP ${response.status}`,
+      `Telegram HTTP ${response.status}: ${body.slice(0, 250)}`
     );
   }
 }
+
 
 function firstMatch(text, regex) {
   const match = text.match(regex);
