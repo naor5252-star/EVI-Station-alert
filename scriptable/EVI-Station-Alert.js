@@ -1,5 +1,5 @@
 // EVI Station Alert — Scriptable widget
-// Monitors SONOL EVI stations 2733 + 2790 at Gamla 3, Hadera.
+// Separate monitoring: SONOL = home, EV Edge KLA = work.
 
 const SCRIPT_NAME = Script.name();
 const KEY_URL = "evi.workerURL";
@@ -29,25 +29,26 @@ await main();
 async function showMenu() {
   const alert = new Alert();
   alert.title = "EVI Station Alert";
-  alert.message = "גמלא 3, חדרה — תחנות 2733 + 2790";
-  alert.addAction("הגדרה / שינוי שרת");
-  alert.addAction("בדיקה עכשיו");
-  alert.addAction("הפעל / כבה מעקב");
+  alert.message = "🏠 SONOL לבית · 🏢 EV Edge לעבודה";
+  alert.addAction("🏠 רענן SONOL");
+  alert.addAction("🏠 הפעל / כבה SONOL");
+  alert.addAction("🏢 רענן EV Edge");
+  alert.addAction("🏢 הפעל / כבה EV Edge");
+  alert.addAction("⚙️ הגדרה / שינוי שרת");
   alert.addCancelAction("סגור");
 
   const choice = await alert.presentSheet();
 
   if (choice === 0) {
-    await setup();
+    await refreshProvider("sonol");
   } else if (choice === 1) {
-    const result = await apiRequest("/refresh", "POST");
-    await presentStatus(result);
+    await toggleProvider("sonol");
   } else if (choice === 2) {
-    const current = await apiRequest("/status", "GET");
-    const result = await apiRequest("/monitor", "POST", {
-      enabled: !current.enabled,
-    });
-    await presentStatus(result);
+    await refreshProvider("evedge");
+  } else if (choice === 3) {
+    await toggleProvider("evedge");
+  } else if (choice === 4) {
+    await setup();
   }
 }
 
@@ -55,7 +56,7 @@ async function setup() {
   const alert = new Alert();
   alert.title = "הגדרת EVI Station Alert";
   alert.message =
-    "הכנס את כתובת ה-Worker ואת ה-CONTROL_TOKEN. הנתונים נשמרים מקומית ב-Keychain של Scriptable.";
+    "הכנס את כתובת ה-Worker ואת ה-CONTROL_TOKEN. פרטי EV Edge נשמרים רק ב-Cloudflare.";
 
   alert.addTextField(
     "Worker URL",
@@ -95,31 +96,22 @@ async function setup() {
 
   const ok = new Alert();
   ok.title = "נשמר ✓";
-  ok.message =
-    "הווידג׳ט יעקוב אחרי תחנות 2733 ו-2790.";
+  ok.message = "SONOL ו-EV Edge משתמשים באותו Worker עם כפתורי ניטור נפרדים.";
   ok.addAction("OK");
   await ok.presentAlert();
 }
 
 async function handleAction(action) {
   try {
-    if (action === "toggle") {
-      const current = await apiRequest("/status", "GET");
-
-      const result = await apiRequest(
-        "/monitor",
-        "POST",
-        { enabled: !current.enabled },
-      );
-
-      await presentStatus(result);
-    } else if (action === "refresh") {
-      const result = await apiRequest(
-        "/refresh",
-        "POST",
-      );
-
-      await presentStatus(result);
+    // Keep old deep-links working for SONOL.
+    if (action === "toggle" || action === "toggle-sonol") {
+      await toggleProvider("sonol");
+    } else if (action === "refresh" || action === "refresh-sonol") {
+      await refreshProvider("sonol");
+    } else if (action === "toggle-evedge") {
+      await toggleProvider("evedge");
+    } else if (action === "refresh-evedge") {
+      await refreshProvider("evedge");
     } else if (action === "setup") {
       await setup();
     }
@@ -132,156 +124,161 @@ async function handleAction(action) {
   }
 }
 
+async function toggleProvider(provider) {
+  const current = await apiRequest(`/${provider}/status`, "GET");
+  const result = await apiRequest(
+    `/${provider}/monitor`,
+    "POST",
+    { enabled: !current.enabled },
+  );
+  await presentProviderStatus(provider, result);
+}
+
+async function refreshProvider(provider) {
+  const result = await apiRequest(`/${provider}/refresh`, "POST");
+  await presentProviderStatus(provider, result);
+}
+
 async function buildWidget() {
   const widget = new ListWidget();
   widget.setPadding(12, 14, 10, 14);
 
-  let status;
+  let all;
   let errorText = null;
 
   try {
-    status = normalizeStatus(
-      await apiRequest("/status", "GET"),
-    );
+    all = await apiRequest("/status/all", "GET");
   } catch (error) {
-    status = emptyStatus();
+    all = {
+      sonol: emptySonolStatus(),
+      evedge: emptyEVEdgeStatus(),
+    };
     errorText = String(error);
   }
+
+  const sonol = normalizeSonol(all.sonol);
+  const evedge = normalizeEVEdge(all.evedge);
 
   const header = widget.addStack();
   header.centerAlignContent();
 
-  const title = header.addText("⚡ גמלא 3, חדרה");
+  const title = header.addText("⚡ טעינה");
   title.font = Font.boldSystemFont(15);
 
   header.addSpacer();
 
-  const toggle = header.addText(
-    status.enabled ? "🟢 ON" : "⚫ OFF",
-  );
+  const sub = header.addText("בית + עבודה");
+  sub.font = Font.systemFont(10);
+  sub.textColor = Color.gray();
 
-  toggle.font = Font.boldSystemFont(13);
-  toggle.url = actionURL("toggle");
+  widget.addSpacer(8);
 
-  widget.addSpacer(6);
-
-  if (errorText || status.lastError) {
-    const error = widget.addText(
-      `⚠️ ${errorText || status.lastError}`,
-    );
-
+  if (errorText) {
+    const error = widget.addText(`⚠️ ${errorText}`);
     error.font = Font.systemFont(10);
     error.textColor = Color.gray();
     error.lineLimit = 4;
   } else {
-    const summary = widget.addStack();
-    summary.centerAlignContent();
+    addProviderRow(widget, {
+      icon: "🏠",
+      title: "בית · גמלא 3",
+      provider: "sonol",
+      status: sonol,
+      countText: `${sonol.availableCount ?? 0} פנויים`,
+      detailText: "SONOL · 2733 + 2790 · כל 30 שנ׳",
+    });
 
-    const count = summary.addText(
-      String(status.availableCount ?? 0),
-    );
+    widget.addSpacer(7);
 
-    count.font = Font.boldSystemFont(28);
+    const evedgeCount = `${evedge.availableCount ?? 0}/${evedge.totalCount ?? 0} פנויות`;
+    addProviderRow(widget, {
+      icon: "🏢",
+      title: "עבודה · KLA",
+      provider: "evedge",
+      status: evedge,
+      countText: evedgeCount,
+      detailText: "EV Edge · בניין 3 + 7 · כל דקה",
+    });
 
-    summary.addSpacer(5);
-
-    const label = summary.addText("פנויים");
-    label.font = Font.systemFont(13);
-    label.textColor = Color.gray();
-
-    summary.addSpacer();
-
-    const refresh = summary.addText("↻ רענן");
-    refresh.font = Font.systemFont(12);
-    refresh.textColor = Color.blue();
-    refresh.url = actionURL("refresh");
-
-    widget.addSpacer(5);
-
-    const rows = (status.sockets || []).slice(0, 4);
-
-    if (rows.length === 0) {
-      const noSockets = widget.addText(
-        "לא התקבלו מחברים מהתחנות",
+    const locations = evedge.locations || [];
+    if (locations.length) {
+      widget.addSpacer(4);
+      const counts = widget.addText(
+        locations
+          .map((loc) =>
+            `${loc.building || loc.id}: ${loc.availableCount ?? 0}/${loc.totalCount ?? 0}`
+          )
+          .join("   "),
       );
-      noSockets.font = Font.systemFont(11);
-      noSockets.textColor = Color.gray();
-    }
-
-    for (const socket of rows) {
-      const row = widget.addStack();
-      row.centerAlignContent();
-
-      const icon = row.addText(
-        statusEmoji(socket.status),
-      );
-      icon.font = Font.systemFont(11);
-
-      row.addSpacer(5);
-
-      const station = row.addText(
-        `${socket.stationId || "?"}`,
-      );
-      station.font = Font.boldSystemFont(11);
-
-      row.addSpacer(5);
-
-      const name = row.addText(
-        compactConnectorName(socket),
-      );
-      name.font = Font.systemFont(11);
-      name.lineLimit = 1;
-
-      row.addSpacer();
-
-      const state = row.addText(
-        statusHebrew(socket.status),
-      );
-      state.font = Font.systemFont(10);
-      state.textColor = Color.gray();
-
-      widget.addSpacer(2);
+      counts.font = Font.systemFont(9);
+      counts.textColor = Color.gray();
+      counts.lineLimit = 1;
     }
   }
 
   widget.addSpacer();
 
-  const footer = widget.addStack();
-  footer.centerAlignContent();
-
-  const monitorText = footer.addText(
-    status.enabled
-      ? "2733 + 2790"
-      : "המעקב כבוי",
+  const footer = widget.addText(
+    "לחץ על ON/OFF של כל שורה כדי לשלוט בניטור בנפרד",
   );
+  footer.font = Font.systemFont(8);
+  footer.textColor = Color.gray();
+  footer.lineLimit = 1;
 
-  monitorText.font = Font.systemFont(8);
-  monitorText.textColor = Color.gray();
-
-  footer.addSpacer();
-
-  const last = footer.addText(
-    status.enabled
-      ? "בדיקה כל 30 שנ׳"
-      : formatLastCheck(status.lastCheck),
-  );
-
-  last.font = Font.systemFont(8);
-  last.textColor = Color.gray();
-
-  widget.refreshAfterDate = new Date(
-    Date.now() +
-      (status.enabled ? 5 : 30) * 60 * 1000,
-  );
+  widget.refreshAfterDate = new Date(Date.now() + 5 * 60 * 1000);
 
   return widget;
 }
 
-async function apiRequest(
-  path,
-  method,
-  body = null,
+function addProviderRow(
+  widget,
+  {
+    icon,
+    title,
+    provider,
+    status,
+    countText,
+    detailText,
+  },
 ) {
+  const top = widget.addStack();
+  top.centerAlignContent();
+
+  const label = top.addText(`${icon} ${title}`);
+  label.font = Font.boldSystemFont(13);
+
+  top.addSpacer();
+
+  const count = top.addText(countText);
+  count.font = Font.boldSystemFont(13);
+
+  top.addSpacer(8);
+
+  const toggle = top.addText(
+    status.enabled ? "🟢 ON" : "⚫ OFF",
+  );
+  toggle.font = Font.boldSystemFont(11);
+  toggle.url = actionURL(`toggle-${provider}`);
+
+  const bottom = widget.addStack();
+  bottom.centerAlignContent();
+
+  const detail = bottom.addText(
+    status.lastError ? `⚠️ ${status.lastError}` : detailText,
+  );
+  detail.font = Font.systemFont(9);
+  detail.textColor = Color.gray();
+  detail.lineLimit = 1;
+
+  bottom.addSpacer();
+
+  const refresh = bottom.addText("↻");
+  refresh.font = Font.systemFont(12);
+  refresh.textColor = Color.blue();
+  refresh.url = actionURL(`refresh-${provider}`);
+}
+
+async function apiRequest(path, method, body = null) {
   if (
     !Keychain.contains(KEY_URL) ||
     !Keychain.contains(KEY_TOKEN)
@@ -306,8 +303,7 @@ async function apiRequest(
   };
 
   if (body) {
-    request.headers["Content-Type"] =
-      "application/json";
+    request.headers["Content-Type"] = "application/json";
     request.body = JSON.stringify(body);
   }
 
@@ -315,9 +311,7 @@ async function apiRequest(
   const code = request.response?.statusCode;
 
   if (code < 200 || code >= 300) {
-    throw new Error(
-      data?.error || `HTTP ${code}`,
-    );
+    throw new Error(data?.error || `HTTP ${code}`);
   }
 
   return data;
@@ -325,160 +319,84 @@ async function apiRequest(
 
 function actionURL(action) {
   const name = encodeURIComponent(SCRIPT_NAME);
-
   return (
     `scriptable:///run?scriptName=${name}` +
     `&action=${encodeURIComponent(action)}`
   );
 }
 
-function normalizeStatus(status) {
-  const normalized = {
-    ...emptyStatus(),
+function normalizeSonol(status) {
+  return {
+    ...emptySonolStatus(),
     ...(status || {}),
   };
-
-  normalized.sockets = (
-    normalized.sockets || []
-  ).map((socket) => ({
-    ...socket,
-    stationId:
-      socket.stationId ||
-      normalized.station?.id ||
-      "?",
-  }));
-
-  return normalized;
 }
 
-function compactConnectorName(socket) {
-  const name = String(
-    socket.name || `מחבר ${socket.id}`,
-  );
-
-  if (/^connector\s+\d+$/i.test(name)) {
-    return name.replace(
-      /^connector/i,
-      "מחבר",
-    );
-  }
-
-  return name;
+function normalizeEVEdge(status) {
+  return {
+    ...emptyEVEdgeStatus(),
+    ...(status || {}),
+  };
 }
 
-function statusEmoji(status) {
-  switch (
-    String(status || "").toUpperCase()
-  ) {
-    case "AVAILABLE":
-      return "🟢";
-
-    case "CHARGING":
-    case "OCCUPIED":
-    case "DISCHARGING":
-      return "🔴";
-
-    case "RESERVED":
-      return "🟡";
-
-    case "IN_MAINTENANCE":
-      return "🛠️";
-
-    case "FAULTED":
-      return "⚠️";
-
-    case "UNAVAILABLE":
-      return "⚫";
-
-    default:
-      return "⚪";
-  }
-}
-
-function statusHebrew(status) {
-  switch (
-    String(status || "").toUpperCase()
-  ) {
-    case "AVAILABLE":
-      return "פנוי";
-
-    case "CHARGING":
-      return "בטעינה";
-
-    case "OCCUPIED":
-      return "תפוס";
-
-    case "DISCHARGING":
-      return "בשימוש";
-
-    case "PAUSED":
-      return "מושהה";
-
-    case "PREPARING":
-      return "בהכנה";
-
-    case "FINISHING":
-      return "מסיים";
-
-    case "RESERVED":
-      return "שמור";
-
-    case "FAULTED":
-      return "תקלה";
-
-    case "UNAVAILABLE":
-      return "לא זמין";
-
-    case "IN_MAINTENANCE":
-      return "בתחזוקה";
-
-    default:
-      return "לא ידוע";
-  }
-}
-
-function formatLastCheck(iso) {
-  if (!iso) return "טרם נבדק";
-
-  const date = new Date(iso);
-  const formatter = new DateFormatter();
-
-  formatter.locale = "he_IL";
-  formatter.useNoDateStyle();
-  formatter.useShortTimeStyle();
-
-  return `עודכן ${formatter.string(date)}`;
-}
-
-function emptyStatus() {
+function emptySonolStatus() {
   return {
     enabled: false,
     lastCheck: null,
     lastError: null,
     availableCount: 0,
     stations: [],
-    station: null,
     sockets: [],
   };
 }
 
-async function presentStatus(status) {
-  const normalized = normalizeStatus(status);
+function emptyEVEdgeStatus() {
+  return {
+    enabled: false,
+    lastCheck: null,
+    lastError: null,
+    availableCount: 0,
+    totalCount: 0,
+    locations: [],
+    evses: [],
+  };
+}
 
-  const stationLines = (
-    normalized.stations || []
-  ).map((station) =>
-    `${station.id}: ${station.availableCount ?? 0}/${station.socketCount ?? 0} פנויים`
-  );
-
+async function presentProviderStatus(provider, status) {
   const alert = new Alert();
-  alert.title = "גמלא 3, חדרה";
 
-  alert.message = [
-    `סה״כ פנויים: ${normalized.availableCount ?? 0}`,
-    ...stationLines,
-    `מעקב: ${normalized.enabled ? "ON" : "OFF"}`,
-  ].join("\n");
+  if (provider === "sonol") {
+    const s = normalizeSonol(status);
+    const stationLines = (s.stations || []).map(
+      (station) =>
+        `${station.id}: ${station.availableCount ?? 0}/${station.socketCount ?? 0} פנויים`,
+    );
+
+    alert.title = "🏠 SONOL · גמלא 3";
+    alert.message = [
+      `סה״כ פנויים: ${s.availableCount ?? 0}`,
+      ...stationLines,
+      `מעקב: ${s.enabled ? "ON" : "OFF"}`,
+      "קצב: כל 30 שניות",
+    ].join("\n");
+  } else {
+    const s = normalizeEVEdge(status);
+    const locationLines = (s.locations || []).map(
+      (location) =>
+        `${location.building || location.id}: ${location.availableCount ?? 0}/${location.totalCount ?? 0} פנויות`,
+    );
+
+    alert.title = "🏢 EV Edge · KLA";
+    alert.message = [
+      `סה״כ פנויות: ${s.availableCount ?? 0}/${s.totalCount ?? 0}`,
+      ...locationLines,
+      `מעקב: ${s.enabled ? "ON" : "OFF"}`,
+      "קצב: כל דקה",
+      s.lastError ? `שגיאה: ${s.lastError}` : null,
+    ]
+      .filter(Boolean)
+      .join("\n");
+  }
 
   alert.addAction("OK");
   await alert.presentAlert();

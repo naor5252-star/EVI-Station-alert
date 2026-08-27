@@ -1,14 +1,25 @@
 # EVI Station Alert ⚡
 
-An iPhone + Scriptable monitor for the SONOL EVI charging station at **Gamla 3, Hadera**.
+An iPhone + Scriptable monitor for two independent charging contexts:
 
-## Goal
+- 🏠 **Home — SONOL EVI, Gamla 3 / Center Park Hadera**
+- 🏢 **Work — EV Edge / KLA, Orbotech Buildings 3 + 7, Yavne**
 
-- Show live connector status in an iPhone Home Screen widget.
-- ON/OFF monitoring from the widget.
-- While ON, check the station every 5 minutes in the cloud.
-- Send an iPhone notification when a connector becomes newly available.
-- Allow a manual refresh from the widget.
+## Monitoring
+
+| Monitor | Source | Targets | Cloud interval |
+| --- | --- | --- | --- |
+| Home | SONOL EVI | Stations `2733`, `2790` | ~30 seconds |
+| Work | EV Edge | Locations `724`, `725` | 60 seconds |
+
+The two monitors have **separate ON/OFF state and separate buttons** in the Scriptable widget.
+
+Telegram notifications are sent only when aggregate availability flips between:
+
+- no free connector
+- at least one free connector
+
+Turning a monitor ON also sends its current availability immediately.
 
 ## Architecture
 
@@ -19,53 +30,66 @@ Scriptable widget (iPhone)
         v
 Cloudflare Worker + KV
         |
-        | every 5 minutes while ON
-        v
-SONOL EVI public Driver Portal API
+        +--> SONOL public Driver Portal API  (~30 sec, when Home monitor is ON)
         |
-        +--> latest connector status stored in KV
-        +--> push notification when availability appears
+        +--> EV Edge driver-app API          (60 sec, when Work monitor is ON)
+        |
+        +--> Telegram notifications
 ```
 
-The 5-minute check runs in Cloudflare, not inside the widget, because iOS does not guarantee that a Home Screen widget will execute network code every 5 minutes.
+## Cloudflare configuration
 
-## Repository layout
+Existing secrets:
+
+- `CONTROL_TOKEN`
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+
+EV Edge additionally requires:
+
+- `EVEDGE_TOKEN` — current EV Edge driver-app bearer token
+- `EVEDGE_DEVICE_ID` — the matching `x-device-id`
+
+Optional:
+
+- `GAMLA_STATION_IDS=2733,2790`
+- `EVEDGE_LOCATION_IDS=724,725`
+
+**Never commit tokens or device/session values to Git.**
+
+If the EV Edge app rotates its session, update `EVEDGE_TOKEN` (and, if needed, `EVEDGE_DEVICE_ID`) in Cloudflare.
+
+## Worker routes
+
+Backward-compatible SONOL routes remain available:
+
+- `GET /status`
+- `POST /monitor`
+- `POST /refresh`
+
+Explicit routes:
+
+- `GET /sonol/status`
+- `POST /sonol/monitor`
+- `POST /sonol/refresh`
+- `GET /evedge/status`
+- `POST /evedge/monitor`
+- `POST /evedge/refresh`
+- `GET /status/all`
+
+All control/status routes require:
 
 ```text
-scriptable/
-  EVI-Station-Alert.js       Scriptable widget
-  config.example.js          Local configuration template
-
-worker/
-  src/index.js               Cloudflare Worker
-  package.json
-  wrangler.jsonc
-
-docs/
-  INSTALL-IPHONE.md
-  DEPLOY-WORKER.md
-  ARCHITECTURE.md
+Authorization: Bearer CONTROL_TOKEN
 ```
-
-## Current status
-
-**V1 bootstrap.** The repository contains the Scriptable widget and Cloudflare Worker skeleton wired for the SONOL EVI public Driver Portal flow discovered during investigation.
 
 ## Security
 
 Do **not** commit:
 
 - `CONTROL_TOKEN`
-- notification topic/token
-- Cloudflare secrets
-- personal session cookies
-
-The repository intentionally contains placeholders only.
-
-## Next milestone
-
-1. Deploy the Worker.
-2. Run one live status check.
-3. Lock the monitor to the exact station ID for Gamla 3 / Center Park Hadera.
-4. Turn on notifications.
-5. Add the Scriptable widget to the Home Screen.
+- `TELEGRAM_BOT_TOKEN`
+- `TELEGRAM_CHAT_ID`
+- `EVEDGE_TOKEN`
+- `EVEDGE_DEVICE_ID`
+- personal cookies or session captures
