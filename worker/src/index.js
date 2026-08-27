@@ -65,6 +65,8 @@ export default {
         const current = await checkAndStore(env, {
           notifyChanges: false,
           preserveBaseline: false,
+          forcePersist: true,
+          previousState: state,
         });
 
         // Always send current status when monitoring is turned ON.
@@ -83,6 +85,7 @@ export default {
         return responseJSON(await checkAndStore(env, {
           notifyChanges: false,
           preserveBaseline: true,
+          forcePersist: true,
         }));
       }
 
@@ -118,12 +121,18 @@ async function runScheduledCheck(env) {
     await checkAndStore(env, {
       notifyChanges: true,
       preserveBaseline: false,
+      forcePersist: false,
+      previousState: state,
     });
   } catch (error) {
-    const latest = await loadState(env);
-    latest.lastCheck = new Date().toISOString();
-    latest.lastError = String(error?.message || error);
-    await saveState(env, latest);
+    const errorText = String(error?.message || error);
+
+    // Persistent failures should not consume a KV write every 30 seconds.
+    if (state.lastError !== errorText) {
+      state.lastError = errorText;
+      state.lastCheck = new Date().toISOString();
+      await saveState(env, state);
+    }
   }
 }
 
@@ -162,9 +171,14 @@ async function saveState(env, state) {
 
 async function checkAndStore(
   env,
-  { notifyChanges, preserveBaseline = false },
+  {
+    notifyChanges,
+    preserveBaseline = false,
+    forcePersist = false,
+    previousState = null,
+  },
 ) {
-  const previous = await loadState(env);
+  const previous = previousState || await loadState(env);
   const live = await fetchGamlaStatus(env);
 
   const currentHasAvailable = live.availableCount > 0;
@@ -194,16 +208,46 @@ async function checkAndStore(
     try {
       await sendCurrentAvailabilityNotification(env, next, false);
     } catch (error) {
-      // Keep old baseline so the next 30-second sample retries the alert.
-      next.lastError =
+      const errorText =
         `Notification failed: ${String(error?.message || error)}`;
-      next.baselineHasAvailable = previousHasAvailable;
-      await saveState(env, next);
-      return next;
+
+      // Keep the previous baseline so the next 30-second check retries.
+      // Persist the error only when it is new, avoiding repeated KV writes.
+      if (previous.lastError !== errorText) {
+        const failed = {
+          ...previous,
+          lastCheck: next.lastCheck,
+          lastError: errorText,
+          availableCount: live.availableCount,
+          stations: live.stations,
+          sockets: live.sockets,
+          availableSocketKeys: live.availableSocketKeys,
+          baselineHasAvailable: previousHasAvailable,
+        };
+        await saveState(env, failed);
+      }
+
+      return {
+        ...next,
+        lastError: errorText,
+        baselineHasAvailable: previousHasAvailable,
+      };
     }
   }
 
-  await saveState(env, next);
+  const recoveredFromError = Boolean(previous.lastError);
+
+  // Normal 30-second samples with no aggregate availability change
+  // do not write to KV.
+  const shouldPersist =
+    forcePersist ||
+    availabilityFlipped ||
+    recoveredFromError;
+
+  if (shouldPersist) {
+    await saveState(env, next);
+  }
+
   return next;
 }
 

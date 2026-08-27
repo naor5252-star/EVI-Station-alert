@@ -251,7 +251,7 @@ async function buildWidget() {
 
   const monitorText = footer.addText(
     status.enabled
-      ? "2733 + 2790 • בדיקה כל 30 שנ׳"
+      ? "2733 + 2790"
       : "המעקב כבוי",
   );
 
@@ -261,7 +261,9 @@ async function buildWidget() {
   footer.addSpacer();
 
   const last = footer.addText(
-    formatLastCheck(status.lastCheck),
+    status.enabled
+      ? "בדיקה כל 30 שנ׳"
+      : formatLastCheck(status.lastCheck),
   );
 
   last.font = Font.systemFont(8);
