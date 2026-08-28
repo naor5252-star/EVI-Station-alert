@@ -202,17 +202,11 @@ async function buildWidget() {
 
     const locations = evedge.locations || [];
     if (locations.length) {
-      widget.addSpacer(4);
-      const counts = widget.addText(
-        locations
-          .map((loc) =>
-            `${loc.building || loc.id}: ${loc.availableCount ?? 0}/${loc.totalCount ?? 0}`
-          )
-          .join("   "),
-      );
-      counts.font = Font.systemFont(9);
-      counts.textColor = Color.gray();
-      counts.lineLimit = 1;
+      widget.addSpacer(3);
+
+      for (const loc of locations) {
+        addEVEdgeBuildingRow(widget, loc);
+      }
     }
   }
 
@@ -228,6 +222,44 @@ async function buildWidget() {
   widget.refreshAfterDate = new Date(Date.now() + 5 * 60 * 1000);
 
   return widget;
+}
+
+function addEVEdgeBuildingRow(widget, location) {
+  const available = Number(location.availableCount || 0);
+  const total = Number(location.totalCount || 0);
+
+  let icon;
+  let stateText;
+
+  if (total === 0) {
+    icon = "⚪";
+    stateText = "לא ידוע";
+  } else if (available > 0) {
+    icon = "🟢";
+    stateText = "יש פנוי";
+  } else {
+    icon = "🔴";
+    stateText = "אין פנוי";
+  }
+
+  const row = widget.addStack();
+  row.centerAlignContent();
+
+  const building = row.addText(
+    `${icon} ${location.building || location.id}`,
+  );
+  building.font = Font.boldSystemFont(10);
+
+  row.addSpacer();
+
+  const status = row.addText(
+    `${stateText} · ${available}/${total}`,
+  );
+  status.font = Font.systemFont(9);
+  status.textColor = Color.gray();
+  status.lineLimit = 1;
+
+  widget.addSpacer(1);
 }
 
 function addProviderRow(
@@ -381,10 +413,15 @@ async function presentProviderStatus(provider, status) {
     ].join("\n");
   } else {
     const s = normalizeEVEdge(status);
-    const locationLines = (s.locations || []).map(
-      (location) =>
-        `${location.building || location.id}: ${location.availableCount ?? 0}/${location.totalCount ?? 0} פנויות`,
-    );
+    const locationLines = (s.locations || []).map((location) => {
+      const available = Number(location.availableCount || 0);
+      const total = Number(location.totalCount || 0);
+      const icon = total === 0 ? "⚪" : (available > 0 ? "🟢" : "🔴");
+      return (
+        `${icon} ${location.building || location.id}: ` +
+        `${available}/${total} פנויות`
+      );
+    });
 
     alert.title = "🏢 EV Edge · KLA";
     alert.message = [

@@ -865,18 +865,40 @@ async function sendEVEdgeAvailabilityNotification(
   state,
   monitoringStarted,
 ) {
-  const lines = (state.locations || []).map(
-    (location) =>
-      `${location.building || location.id}: ${location.availableCount ?? 0}/${location.totalCount ?? 0} פנויות`
+  const locations = state.locations || [];
+
+  const availableLocations = locations.filter(
+    (location) => Number(location.availableCount || 0) > 0
   );
 
-  const hasAvailable = Number(state.availableCount || 0) > 0;
+  const availableBuildingNames = availableLocations.map(
+    (location) => String(location.building || location.id)
+  );
+
+  let headline;
+  if (availableBuildingNames.length === 1) {
+    headline = `🟢 יש עמדה פנויה: ${availableBuildingNames[0]}`;
+  } else if (availableBuildingNames.length > 1) {
+    headline =
+      `🟢 יש עמדות פנויות: ${availableBuildingNames.join(" + ")}`;
+  } else {
+    headline = "🔴 אין עמדות פנויות ב-KLA";
+  }
+
+  const lines = locations.map((location) => {
+    const available = Number(location.availableCount || 0);
+    const total = Number(location.totalCount || 0);
+    const icon = total === 0 ? "⚪" : (available > 0 ? "🟢" : "🔴");
+
+    return (
+      `${icon} ${location.building || location.id}: ` +
+      `${available}/${total} פנויות`
+    );
+  });
 
   const message = [
     monitoringStarted ? "✅ מעקב העבודה הופעל" : null,
-    hasAvailable
-      ? "🟢 יש עמדה פנויה ב-KLA"
-      : "🔴 אין עמדות פנויות ב-KLA",
+    headline,
     ...lines,
     `סה״כ: ${state.availableCount ?? 0}/${state.totalCount ?? 0} פנויות`,
   ]
