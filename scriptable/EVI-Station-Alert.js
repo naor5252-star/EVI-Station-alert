@@ -179,41 +179,52 @@ async function buildWidget() {
     error.textColor = Color.gray();
     error.lineLimit = 4;
   } else {
-    addProviderRow(widget, {
+    const sonolTotal = (sonol.stations || []).reduce(
+      (sum, station) => sum + Number(station.socketCount || 0),
+      0,
+    );
+
+    const sonolRows = (sonol.stations || []).map((station) => ({
+      label: `תחנה ${station.id}`,
+      available: Number(station.availableCount || 0),
+      total: Number(station.socketCount || 0),
+    }));
+
+    addStatusGroup(widget, {
       icon: "🏠",
       title: "בית · גמלא 3",
       provider: "sonol",
       status: sonol,
-      countText: `${sonol.availableCount ?? 0} פנויים`,
-      detailText: "SONOL · 2733 + 2790 · כל 30 שנ׳",
+      available: Number(sonol.availableCount || 0),
+      total: sonolTotal,
+      cadence: "כל 30 שנ׳",
+      subRows: sonolRows,
     });
 
-    widget.addSpacer(7);
+    widget.addSpacer(8);
 
-    const evedgeCount = `${evedge.availableCount ?? 0}/${evedge.totalCount ?? 0} פנויות`;
-    addProviderRow(widget, {
+    const evEdgeRows = (evedge.locations || []).map((location) => ({
+      label: location.building || location.id,
+      available: Number(location.availableCount || 0),
+      total: Number(location.totalCount || 0),
+    }));
+
+    addStatusGroup(widget, {
       icon: "🏢",
       title: "עבודה · KLA",
       provider: "evedge",
       status: evedge,
-      countText: evedgeCount,
-      detailText: "EV Edge · בניין 3 + 7 · כל דקה",
+      available: Number(evedge.availableCount || 0),
+      total: Number(evedge.totalCount || 0),
+      cadence: "כל דקה",
+      subRows: evEdgeRows,
     });
-
-    const locations = evedge.locations || [];
-    if (locations.length) {
-      widget.addSpacer(3);
-
-      for (const loc of locations) {
-        addEVEdgeBuildingRow(widget, loc);
-      }
-    }
   }
 
   widget.addSpacer();
 
   const footer = widget.addText(
-    "לחץ על ON/OFF של כל שורה כדי לשלוט בניטור בנפרד",
+    "דגימה = ניטור אוטומטי · 🟢 יש פנוי · 🔴 אין פנוי",
   );
   footer.font = Font.systemFont(8);
   footer.textColor = Color.gray();
@@ -224,88 +235,126 @@ async function buildWidget() {
   return widget;
 }
 
-function addEVEdgeBuildingRow(widget, location) {
-  const available = Number(location.availableCount || 0);
-  const total = Number(location.totalCount || 0);
+function availabilityPresentation(available, total) {
+  const free = Number(available || 0);
+  const capacity = Number(total || 0);
 
-  let icon;
-  let stateText;
-
-  if (total === 0) {
-    icon = "⚪";
-    stateText = "לא ידוע";
-  } else if (available > 0) {
-    icon = "🟢";
-    stateText = "יש פנוי";
-  } else {
-    icon = "🔴";
-    stateText = "אין פנוי";
+  if (free > 0) {
+    return {
+      icon: "🟢",
+      text: "יש עמדות פנויות",
+      count: capacity > 0 ? `${free}/${capacity}` : `${free}`,
+    };
   }
 
-  const row = widget.addStack();
-  row.centerAlignContent();
+  if (capacity > 0) {
+    return {
+      icon: "🔴",
+      text: "אין עמדות פנויות",
+      count: `0/${capacity}`,
+    };
+  }
 
-  const building = row.addText(
-    `${icon} ${location.building || location.id}`,
-  );
-  building.font = Font.boldSystemFont(10);
-
-  row.addSpacer();
-
-  const status = row.addText(
-    `${stateText} · ${available}/${total}`,
-  );
-  status.font = Font.systemFont(9);
-  status.textColor = Color.gray();
-  status.lineLimit = 1;
-
-  widget.addSpacer(1);
+  return {
+    icon: "⚪",
+    text: "מצב לא ידוע",
+    count: "",
+  };
 }
 
-function addProviderRow(
+function addStatusGroup(
   widget,
   {
     icon,
     title,
     provider,
     status,
-    countText,
-    detailText,
+    available,
+    total,
+    cadence,
+    subRows = [],
   },
 ) {
-  const top = widget.addStack();
-  top.centerAlignContent();
+  const sampleActive = status.enabled === true;
+  const availability = availabilityPresentation(available, total);
 
-  const label = top.addText(`${icon} ${title}`);
+  const header = widget.addStack();
+  header.centerAlignContent();
+
+  const label = header.addText(`${icon} ${title}`);
   label.font = Font.boldSystemFont(13);
 
-  top.addSpacer();
+  header.addSpacer();
 
-  const count = top.addText(countText);
-  count.font = Font.boldSystemFont(13);
-
-  top.addSpacer(8);
-
-  const toggle = top.addText(
-    status.enabled ? "🟢 ON" : "⚫ OFF",
+  const sampling = header.addText(
+    sampleActive ? "🟢 דגימה פעילה" : "⚫ דגימה כבויה",
   );
-  toggle.font = Font.boldSystemFont(11);
-  toggle.url = actionURL(`toggle-${provider}`);
+  sampling.font = Font.boldSystemFont(10);
+  sampling.url = actionURL(`toggle-${provider}`);
+
+  widget.addSpacer(2);
+
+  const availabilityRow = widget.addStack();
+  availabilityRow.centerAlignContent();
+
+  const availabilityText = availabilityRow.addText(
+    `${availability.icon} ${availability.text}`,
+  );
+  availabilityText.font = Font.boldSystemFont(12);
+
+  availabilityRow.addSpacer();
+
+  if (availability.count) {
+    const count = availabilityRow.addText(availability.count);
+    count.font = Font.boldSystemFont(12);
+  }
+
+  for (const row of subRows) {
+    widget.addSpacer(2);
+
+    const item = widget.addStack();
+    item.centerAlignContent();
+
+    const itemStatus = availabilityPresentation(
+      row.available,
+      row.total,
+    );
+
+    const itemLabel = item.addText(
+      `${itemStatus.icon} ${row.label}`,
+    );
+    itemLabel.font = Font.systemFont(9);
+
+    item.addSpacer();
+
+    const itemText = item.addText(
+      itemStatus.count
+        ? `${itemStatus.text} · ${itemStatus.count}`
+        : itemStatus.text,
+    );
+    itemText.font = Font.systemFont(9);
+    itemText.textColor = Color.gray();
+    itemText.lineLimit = 1;
+  }
+
+  widget.addSpacer(2);
 
   const bottom = widget.addStack();
   bottom.centerAlignContent();
 
   const detail = bottom.addText(
-    status.lastError ? `⚠️ ${status.lastError}` : detailText,
+    status.lastError
+      ? `⚠️ ${status.lastError}`
+      : `דגימה: ${sampleActive ? "פעילה" : "כבויה"} · ${cadence}`,
   );
-  detail.font = Font.systemFont(9);
+  detail.font = Font.systemFont(8);
   detail.textColor = Color.gray();
   detail.lineLimit = 1;
 
   bottom.addSpacer();
 
-  const refresh = bottom.addText("↻");
-  refresh.font = Font.systemFont(12);
+  const refresh = bottom.addText("↻ רענון");
+  refresh.font = Font.systemFont(9);
   refresh.textColor = Color.blue();
   refresh.url = actionURL(`refresh-${provider}`);
 }
