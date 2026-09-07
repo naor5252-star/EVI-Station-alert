@@ -62,7 +62,7 @@ export default {
         return responseJSON(await checkSonolAndStore(env, {
           notifyChanges: false,
           preserveBaseline: true,
-          forcePersist: true,
+          forcePersist: false,
         }));
       }
 
@@ -77,7 +77,7 @@ export default {
         return responseJSON(await checkSonolAndStore(env, {
           notifyChanges: false,
           preserveBaseline: true,
-          forcePersist: true,
+          forcePersist: false,
         }));
       }
 
@@ -92,7 +92,7 @@ export default {
         return responseJSON(await checkEVEdgeAndStore(env, {
           notifyChanges: false,
           preserveBaseline: true,
-          forcePersist: true,
+          forcePersist: false,
         }));
       }
 
@@ -344,6 +344,9 @@ async function checkSonolAndStore(
   const availabilityFlipped =
     previousHasAvailable !== currentHasAvailable;
 
+  const stateChanged =
+    sonolStatusSignature(previous) !== sonolStatusSignature(next);
+
   if (notifyChanges && previous.enabled && availabilityFlipped) {
     try {
       await sendSonolAvailabilityNotification(env, next, false);
@@ -376,7 +379,7 @@ async function checkSonolAndStore(
   const recoveredFromError = Boolean(previous.lastError);
   const shouldPersist =
     forcePersist ||
-    availabilityFlipped ||
+    stateChanged ||
     recoveredFromError;
 
   if (shouldPersist) {
@@ -419,9 +422,10 @@ async function checkEVEdgeAndStore(
 
   const availabilityFlipped =
     previousHasAvailable !== currentHasAvailable;
-  const countChanged =
-    Number(previous.availableCount || 0) !== Number(live.availableCount || 0) ||
-    Number(previous.totalCount || 0) !== Number(live.totalCount || 0);
+
+  // Detect a real change even when aggregate counts are identical.
+  const stateChanged =
+    evEdgeStatusSignature(previous) !== evEdgeStatusSignature(next);
 
   if (notifyChanges && previous.enabled && availabilityFlipped) {
     try {
@@ -455,8 +459,7 @@ async function checkEVEdgeAndStore(
   const recoveredFromError = Boolean(previous.lastError);
   const shouldPersist =
     forcePersist ||
-    availabilityFlipped ||
-    countChanged ||
+    stateChanged ||
     recoveredFromError;
 
   if (shouldPersist) {
@@ -464,6 +467,39 @@ async function checkEVEdgeAndStore(
   }
 
   return next;
+}
+
+function sonolStatusSignature(state) {
+  return JSON.stringify(
+    (state?.sockets || [])
+      .map((socket) => ({
+        key: `${socket?.stationId || ""}:${socket?.id || ""}`,
+        status: String(socket?.status || ""),
+        available: socket?.available === true,
+        reserved: socket?.reserved === true,
+        blocked: socket?.blocked === true,
+        inMaintenance: socket?.inMaintenance === true,
+      }))
+      .sort((a, b) => a.key.localeCompare(b.key))
+  );
+}
+
+function evEdgeStatusSignature(state) {
+  return JSON.stringify(
+    (state?.evses || [])
+      .map((evse) => ({
+        key: String(
+          evse?.identifier ||
+          `${evse?.locationId || ""}:${evse?.id || ""}`
+        ),
+        locationId: String(evse?.locationId || ""),
+        status: String(evse?.status || ""),
+        available: evse?.available === true,
+        temporary: evse?.isTemporarilyUnavailable === true,
+        longTerm: evse?.isLongTermUnavailable === true,
+      }))
+      .sort((a, b) => a.key.localeCompare(b.key))
+  );
 }
 
 async function fetchGamlaStatus(env) {
