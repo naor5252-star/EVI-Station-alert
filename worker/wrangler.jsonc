@@ -6,11 +6,17 @@
   "observability": {
     "enabled": true
   },
-  "kv_namespaces": [
-    {
-      "binding": "STATE"
-    }
-  ],
+  // KV/database binding disabled. Runtime memory is used instead.
+
+  // "kv_namespaces": [
+
+  //   {
+
+  //     "binding": "STATE"
+
+  //   }
+
+  // ],
   "triggers": {
     "crons": [
       "* * * * *"

@@ -36,6 +36,9 @@ export default {
         return responseJSON({
           ok: true,
           service: "EVI Station Alert",
+          storage: "memory-only",
+          database: "disabled",
+          statePersistence: "best-effort per Worker isolate",
           monitors: {
             sonol: {
               interval: "30 seconds",
@@ -53,7 +56,7 @@ export default {
 
       // Backward-compatible SONOL routes.
       if (url.pathname === "/status" && request.method === "GET") {
-        return responseJSON(await loadSonolState(env));
+        return responseJSON(await getLiveSonolStatus(env));
       }
       if (url.pathname === "/monitor" && request.method === "POST") {
         return handleSonolMonitor(request, env);
@@ -68,7 +71,7 @@ export default {
 
       // Explicit SONOL routes.
       if (url.pathname === "/sonol/status" && request.method === "GET") {
-        return responseJSON(await loadSonolState(env));
+        return responseJSON(await getLiveSonolStatus(env));
       }
       if (url.pathname === "/sonol/monitor" && request.method === "POST") {
         return handleSonolMonitor(request, env);
@@ -83,7 +86,7 @@ export default {
 
       // EV Edge work monitor.
       if (url.pathname === "/evedge/status" && request.method === "GET") {
-        return responseJSON(await loadEVEdgeState(env));
+        return responseJSON(await getLiveEVEdgeStatus(env));
       }
       if (url.pathname === "/evedge/monitor" && request.method === "POST") {
         return handleEVEdgeMonitor(request, env);
@@ -98,8 +101,8 @@ export default {
 
       if (url.pathname === "/status/all" && request.method === "GET") {
         const [sonol, evedge] = await Promise.all([
-          loadSonolState(env),
-          loadEVEdgeState(env),
+          getLiveSonolStatus(env),
+          getLiveEVEdgeStatus(env),
         ]);
         return responseJSON({ sonol, evedge });
       }
@@ -291,23 +294,118 @@ function requireAuth(request, env) {
   }
 }
 
-async function loadSonolState(env) {
-  // Keep the old key so existing SONOL state survives this upgrade.
-  const saved = await env.STATE.get("monitor", "json");
-  return { ...EMPTY_SONOL_STATE, ...(saved || {}) };
+// ======================================================================
+// RUNTIME STATE ONLY — KV/DATABASE DISABLED
+// ======================================================================
+//
+// IMPORTANT:
+// Cloudflare Worker module memory belongs to one running isolate.
+// It is NOT durable storage and Cloudflare may recycle the isolate.
+// Therefore this state is intentionally best-effort and may reset.
+//
+// Monitoring defaults to ON after a fresh isolate starts.
+// Optional Worker variables can override that default:
+//   SONOL_MONITOR_DEFAULT=false
+//   EVEDGE_MONITOR_DEFAULT=false
+//
+// The /monitor endpoints still change enabled/disabled in the current
+// isolate, but that toggle cannot survive an isolate restart without
+// persistent storage.
+//
+// Old KV implementation is intentionally kept below as comments.
+//
+// async function loadSonolStateFromKV(env) {
+//   const saved = await env.STATE.get("monitor", "json");
+//   return { ...EMPTY_SONOL_STATE, ...(saved || {}) };
+// }
+//
+// async function saveSonolStateToKV(env, state) {
+//   await env.STATE.put("monitor", JSON.stringify(state));
+// }
+//
+// async function loadEVEdgeStateFromKV(env) {
+//   const saved = await env.STATE.get("evedge-monitor", "json");
+//   return { ...EMPTY_EVEDGE_STATE, ...(saved || {}) };
+// }
+//
+// async function saveEVEdgeStateToKV(env, state) {
+//   await env.STATE.put("evedge-monitor", JSON.stringify(state));
+// }
+
+let runtimeSonolState = null;
+let runtimeEVEdgeState = null;
+
+function cloneRuntimeState(state) {
+  return JSON.parse(JSON.stringify(state));
 }
 
-async function saveSonolState(env, state) {
-  await env.STATE.put("monitor", JSON.stringify(state));
+function envBoolean(value, defaultValue) {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return defaultValue;
+  }
+
+  const normalized = String(value).trim().toLowerCase();
+
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+
+  return defaultValue;
+}
+
+async function loadSonolState(env) {
+  if (!runtimeSonolState) {
+    runtimeSonolState = {
+      ...EMPTY_SONOL_STATE,
+      enabled: envBoolean(env?.SONOL_MONITOR_DEFAULT, true),
+    };
+  }
+
+  return cloneRuntimeState(runtimeSonolState);
+}
+
+async function saveSonolState(_env, state) {
+  // DATABASE/KV WRITE DISABLED:
+  // await env.STATE.put("monitor", JSON.stringify(state));
+  runtimeSonolState = cloneRuntimeState(state);
 }
 
 async function loadEVEdgeState(env) {
-  const saved = await env.STATE.get("evedge-monitor", "json");
-  return { ...EMPTY_EVEDGE_STATE, ...(saved || {}) };
+  if (!runtimeEVEdgeState) {
+    runtimeEVEdgeState = {
+      ...EMPTY_EVEDGE_STATE,
+      enabled: envBoolean(env?.EVEDGE_MONITOR_DEFAULT, true),
+    };
+  }
+
+  return cloneRuntimeState(runtimeEVEdgeState);
 }
 
-async function saveEVEdgeState(env, state) {
-  await env.STATE.put("evedge-monitor", JSON.stringify(state));
+async function saveEVEdgeState(_env, state) {
+  // DATABASE/KV WRITE DISABLED:
+  // await env.STATE.put("evedge-monitor", JSON.stringify(state));
+  runtimeEVEdgeState = cloneRuntimeState(state);
+}
+
+async function getLiveSonolStatus(env) {
+  const previous = await loadSonolState(env);
+
+  return checkSonolAndStore(env, {
+    notifyChanges: false,
+    preserveBaseline: false,
+    forcePersist: false,
+    previousState: previous,
+  });
+}
+
+async function getLiveEVEdgeStatus(env) {
+  const previous = await loadEVEdgeState(env);
+
+  return checkEVEdgeAndStore(env, {
+    notifyChanges: false,
+    preserveBaseline: false,
+    forcePersist: false,
+    previousState: previous,
+  });
 }
 
 async function checkSonolAndStore(
@@ -344,10 +442,15 @@ async function checkSonolAndStore(
   const availabilityFlipped =
     previousHasAvailable !== currentHasAvailable;
 
+  const hasRuntimeBaseline =
+    previous.lastCheck !== null &&
+    Array.isArray(previous.sockets) &&
+    previous.sockets.length > 0;
+
   const stateChanged =
     sonolStatusSignature(previous) !== sonolStatusSignature(next);
 
-  if (notifyChanges && previous.enabled && availabilityFlipped) {
+  if (notifyChanges && previous.enabled && hasRuntimeBaseline && availabilityFlipped) {
     try {
       await sendSonolAvailabilityNotification(env, next, false);
     } catch (error) {
@@ -423,11 +526,16 @@ async function checkEVEdgeAndStore(
   const availabilityFlipped =
     previousHasAvailable !== currentHasAvailable;
 
+  const hasRuntimeBaseline =
+    previous.lastCheck !== null &&
+    Array.isArray(previous.evses) &&
+    previous.evses.length > 0;
+
   // Detect a real change even when aggregate counts are identical.
   const stateChanged =
     evEdgeStatusSignature(previous) !== evEdgeStatusSignature(next);
 
-  if (notifyChanges && previous.enabled && availabilityFlipped) {
+  if (notifyChanges && previous.enabled && hasRuntimeBaseline && availabilityFlipped) {
     try {
       await sendEVEdgeAvailabilityNotification(env, next, false);
     } catch (error) {
